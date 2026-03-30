@@ -2,49 +2,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// =======================
-// PIC16F18855 - BASIC STARTER CODE
-// XC8 / MPLAB X
-// =======================
+// =====================================================
+// PIC16F18855 + Flexem HMI + RS485 (Auto RX/TX) Starter
+// - Internal oscillator: 32 MHz
+// - Modbus RTU slave basic communication check
+// - HMI coil control for Motor/Blower/Heater relay outputs
+// =====================================================
 
-// NOTE:
-// 1) Add/adjust configuration bits from MPLAB Code Configurator (MCC)
-//    based on your hardware clock and watchdog requirements.
-// 2) This starter focuses on pin direction + basic manual Modbus coil mapping.
-
-#define _XTAL_FREQ 16000000UL
+#define _XTAL_FREQ 32000000UL
 
 // -----------------------
-// Pin mapping (as provided)
+// User settings
 // -----------------------
-//  1 MCLR/VPP  : Reset
-//  2 RA0       : Temp Sensor 1 (analog)
-//  3 RA1       : Temp Sensor 2 (analog)
-//  4 RA2       : Humidity Sensor Analog (analog)
-//  5 RA3       : Spare
-//  6 RA4       : Phase Preventer Input
-//  7 RA5       : Spare
-//  8 VSS       : GND
-//  9 OSC1/CLKIN
-// 10 OSC2/CLKOUT
-// 11 RC0       : Main Motor Forward
-// 12 RC1       : Main Motor Reverse
-// 13 RC2       : Blower
-// 14 RC3       : Heater
-// 15 RC4       : Crusher Forward
-// 16 RC5       : Crusher Reverse
-// 17 RC6       : RS485 TX
-// 18 RC7       : RS485 RX
-// 19 VSS       : GND
-// 20 VDD       : +5V
-// 21 RB0       : Door 1
-// 22 RB1       : Door 2
-// 23 RB2       : Humidity Digital Threshold
-// 24 RB3       : Emergency Stop
-// 25 RB4       : Extra Relay Output 1
-// 26 RB5       : Not used for RS485 DE/RE (auto RX/TX module)
-// 27 RB6       : Spare
-// 28 RB7       : Spare
+#define MODBUS_SLAVE_ID                1u
+#define MODBUS_MAX_FRAME               64u
+#define MODBUS_COMM_TIMEOUT_LOOPS      50000UL
 
 // -----------------------
 // HMI/Modbus coil mapping (0x)
@@ -59,6 +31,7 @@
 #define COIL_HEATER_STOP       7u
 #define COIL_MANUAL_MODE       10u
 #define COIL_AUTO_MODE         11u
+#define COIL_COUNT             16u
 
 // -----------------------
 // Output controls
@@ -69,10 +42,10 @@
 #define HEATER_LAT             LATCbits.LATC3
 #define CRUSHER_FWD_LAT        LATCbits.LATC4
 #define CRUSHER_REV_LAT        LATCbits.LATC5
-#define EXTRA_RELAY_LAT        LATBbits.LATB4
+#define COMM_OK_RELAY_LAT      LATBbits.LATB4
 
 // -----------------------
-// Input reads
+// Inputs
 // -----------------------
 #define DOOR1_PORT             PORTBbits.RB0
 #define DOOR2_PORT             PORTBbits.RB1
@@ -86,51 +59,109 @@ typedef struct
     bool auto_mode;
 } system_mode_t;
 
-static volatile system_mode_t g_mode = { .manual_mode = true, .auto_mode = false };
+static volatile system_mode_t g_mode = { true, false };
+static volatile bool g_coils[COIL_COUNT];
+static volatile uint32_t g_comm_watchdog = 0;
+
+// =====================================================
+// Low-level init
+// =====================================================
+static void clock_init_32mhz_internal(void)
+{
+    // HFINTOSC selected, divider 1:1
+    OSCCON1bits.NDIV = 0b0000;
+    OSCCON1bits.NOSC = 0b110;
+
+    // HFINTOSC frequency = 32 MHz
+    OSCFRQbits.HFFRQ = 0b101;
+}
 
 static void gpio_init(void)
 {
-    // --- Analog configuration ---
-    // RA0/RA1/RA2 are analog sensors.
+    // RA0/RA1/RA2 analog sensors
     ANSELAbits.ANSA0 = 1;
     ANSELAbits.ANSA1 = 1;
     ANSELAbits.ANSA2 = 1;
 
-    // Other A pins digital.
+    // RA3/RA4/RA5 digital
     ANSELAbits.ANSA3 = 0;
     ANSELAbits.ANSA4 = 0;
     ANSELAbits.ANSA5 = 0;
 
-    // Port B/C as digital for now.
     ANSELB = 0x00;
     ANSELC = 0x00;
 
-    // --- TRIS (1=input, 0=output) ---
-    TRISA = 0x3F; // RA0..RA5 inputs (sensors/spares)
+    // Port directions
+    TRISA = 0x3F; // RA0..RA5 input
 
-    TRISBbits.TRISB0 = 1; // Door1
-    TRISBbits.TRISB1 = 1; // Door2
-    TRISBbits.TRISB2 = 1; // Humidity digital
-    TRISBbits.TRISB3 = 1; // E-Stop
-    TRISBbits.TRISB4 = 0; // Extra relay output
-    TRISBbits.TRISB5 = 1; // Unused for DE/RE (keep input)
+    TRISBbits.TRISB0 = 1; // Door 1
+    TRISBbits.TRISB1 = 1; // Door 2
+    TRISBbits.TRISB2 = 1; // Humidity digital threshold
+    TRISBbits.TRISB3 = 1; // Emergency stop
+    TRISBbits.TRISB4 = 0; // Extra relay / COMM OK indication
+    TRISBbits.TRISB5 = 1; // NOT used for RS485 DE/RE (auto direction module)
     TRISBbits.TRISB6 = 1; // Spare
     TRISBbits.TRISB7 = 1; // Spare
 
-    TRISCbits.TRISC0 = 0; // Motor FWD
-    TRISCbits.TRISC1 = 0; // Motor REV
-    TRISCbits.TRISC2 = 0; // Blower
-    TRISCbits.TRISC3 = 0; // Heater
-    TRISCbits.TRISC4 = 0; // Crusher FWD
-    TRISCbits.TRISC5 = 0; // Crusher REV
-    TRISCbits.TRISC6 = 0; // UART TX (RS485)
-    TRISCbits.TRISC7 = 1; // UART RX (RS485)
+    TRISCbits.TRISC0 = 0; // Main motor forward relay
+    TRISCbits.TRISC1 = 0; // Main motor reverse relay
+    TRISCbits.TRISC2 = 0; // Blower relay
+    TRISCbits.TRISC3 = 0; // Heater relay
+    TRISCbits.TRISC4 = 0; // Crusher forward relay
+    TRISCbits.TRISC5 = 0; // Crusher reverse relay
+    TRISCbits.TRISC6 = 0; // RS485 TX (EUSART TX)
+    TRISCbits.TRISC7 = 1; // RS485 RX (EUSART RX)
 
-    // --- Safe startup states ---
+    // Safe state
     LATC = 0x00;
-    LATBbits.LATB4 = 0;
+    COMM_OK_RELAY_LAT = 0;
 }
 
+static void uart_init_9600_8n1(void)
+{
+    // PPS mapping for EUSART1
+    RC6PPS = 0x14;   // RC6 -> TX1
+    RX1PPS = 0x17;   // RC7 -> RX1
+
+    BAUD1CONbits.BRG16 = 1;
+    TX1STAbits.BRGH = 1;
+
+    // Fosc=32MHz, baud=9600, BRGH=1, BRG16=1 => SP1BRG ~= 832
+    SP1BRGH = 0x03;
+    SP1BRGL = 0x40;
+
+    RC1STAbits.SPEN = 1;
+    RC1STAbits.CREN = 1;
+    TX1STAbits.SYNC = 0;
+    TX1STAbits.TXEN = 1;
+}
+
+static inline void uart_write_byte(uint8_t b)
+{
+    while (!PIR3bits.TX1IF)
+    {
+    }
+    TX1REG = b;
+}
+
+static inline bool uart_read_byte_nonblocking(uint8_t *out)
+{
+    if (PIR3bits.RC1IF)
+    {
+        if (RC1STAbits.OERR)
+        {
+            RC1STAbits.CREN = 0;
+            RC1STAbits.CREN = 1;
+        }
+        *out = RC1REG;
+        return true;
+    }
+    return false;
+}
+
+// =====================================================
+// Application control
+// =====================================================
 static void outputs_all_stop(void)
 {
     MAIN_MOTOR_FWD_LAT = 0;
@@ -145,31 +176,17 @@ static void set_manual_mode(bool enable)
 {
     g_mode.manual_mode = enable;
     g_mode.auto_mode = !enable;
-
-    // Optional safety behavior on mode change
     outputs_all_stop();
 }
 
-// Call this from your Modbus stack whenever a coil write is received.
-void modbus_handle_coil_write(uint16_t coil_address, bool value)
+static void execute_manual_commands(uint16_t coil_address)
 {
-    (void)value; // start/stop coils are edge-command style in this starter.
-
     switch (coil_address)
     {
-        case COIL_MANUAL_MODE:
-            set_manual_mode(true);
-            break;
-
-        case COIL_AUTO_MODE:
-            set_manual_mode(false);
-            break;
-
-        // Manual mode controls (from HMI buttons)
         case COIL_MOTOR_FWD_START:
             if (g_mode.manual_mode)
             {
-                MAIN_MOTOR_REV_LAT = 0; // interlock
+                MAIN_MOTOR_REV_LAT = 0;
                 MAIN_MOTOR_FWD_LAT = 1;
             }
             break;
@@ -181,7 +198,7 @@ void modbus_handle_coil_write(uint16_t coil_address, bool value)
         case COIL_MOTOR_REV_START:
             if (g_mode.manual_mode)
             {
-                MAIN_MOTOR_FWD_LAT = 0; // interlock
+                MAIN_MOTOR_FWD_LAT = 0;
                 MAIN_MOTOR_REV_LAT = 1;
             }
             break;
@@ -212,22 +229,239 @@ void modbus_handle_coil_write(uint16_t coil_address, bool value)
             HEATER_LAT = 0;
             break;
 
-        default:
-            // Unknown/unused coil.
+        case COIL_MANUAL_MODE:
+            set_manual_mode(true);
             break;
+
+        case COIL_AUTO_MODE:
+            set_manual_mode(false);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// =====================================================
+// Modbus RTU minimal stack
+// Supported FC:
+//  - 0x01 Read Coils (for HMI communication check)
+//  - 0x05 Write Single Coil (for HMI control buttons)
+// =====================================================
+static uint16_t modbus_crc16(const uint8_t *buf, uint8_t len)
+{
+    uint16_t crc = 0xFFFF;
+    uint8_t i;
+    uint8_t j;
+
+    for (i = 0; i < len; i++)
+    {
+        crc ^= buf[i];
+        for (j = 0; j < 8; j++)
+        {
+            if (crc & 0x0001)
+            {
+                crc >>= 1;
+                crc ^= 0xA001;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+static void modbus_send_response(const uint8_t *data, uint8_t len)
+{
+    uint8_t i;
+    for (i = 0; i < len; i++)
+    {
+        uart_write_byte(data[i]);
+    }
+}
+
+static void modbus_send_exception(uint8_t function, uint8_t ex_code)
+{
+    uint8_t resp[5];
+    uint16_t crc;
+
+    resp[0] = MODBUS_SLAVE_ID;
+    resp[1] = (uint8_t)(function | 0x80u);
+    resp[2] = ex_code;
+
+    crc = modbus_crc16(resp, 3);
+    resp[3] = (uint8_t)(crc & 0xFFu);
+    resp[4] = (uint8_t)(crc >> 8);
+
+    modbus_send_response(resp, 5);
+}
+
+static void modbus_process_fc01_read_coils(const uint8_t *req)
+{
+    uint16_t start = (uint16_t)req[2] << 8 | req[3];
+    uint16_t qty = (uint16_t)req[4] << 8 | req[5];
+    uint8_t resp[32];
+    uint8_t byte_count;
+    uint16_t crc;
+    uint16_t i;
+
+    if ((qty == 0u) || (qty > COIL_COUNT) || ((start + qty) > COIL_COUNT))
+    {
+        modbus_send_exception(0x01, 0x02); // illegal data address
+        return;
+    }
+
+    byte_count = (uint8_t)((qty + 7u) / 8u);
+    resp[0] = MODBUS_SLAVE_ID;
+    resp[1] = 0x01;
+    resp[2] = byte_count;
+
+    for (i = 0; i < byte_count; i++)
+    {
+        resp[3 + i] = 0;
+    }
+
+    for (i = 0; i < qty; i++)
+    {
+        if (g_coils[start + i])
+        {
+            resp[3 + (i / 8u)] |= (uint8_t)(1u << (i % 8u));
+        }
+    }
+
+    crc = modbus_crc16(resp, (uint8_t)(3u + byte_count));
+    resp[3 + byte_count] = (uint8_t)(crc & 0xFFu);
+    resp[4 + byte_count] = (uint8_t)(crc >> 8);
+
+    modbus_send_response(resp, (uint8_t)(5u + byte_count));
+}
+
+static void modbus_process_fc05_write_single_coil(const uint8_t *req)
+{
+    uint16_t addr = (uint16_t)req[2] << 8 | req[3];
+    uint16_t val = (uint16_t)req[4] << 8 | req[5];
+
+    if (addr >= COIL_COUNT)
+    {
+        modbus_send_exception(0x05, 0x02);
+        return;
+    }
+
+    if ((val != 0xFF00u) && (val != 0x0000u))
+    {
+        modbus_send_exception(0x05, 0x03); // illegal data value
+        return;
+    }
+
+    g_coils[addr] = (val == 0xFF00u);
+
+    // Execute action on coil write
+    if (g_coils[addr])
+    {
+        execute_manual_commands(addr);
+
+        // command coils are momentary; clear after action
+        if (addr <= COIL_HEATER_STOP)
+        {
+            g_coils[addr] = false;
+        }
+    }
+
+    // FC05 response is exact echo of request
+    modbus_send_response(req, 8);
+}
+
+static void modbus_process_frame(uint8_t *frame, uint8_t len)
+{
+    uint16_t rx_crc;
+    uint16_t calc_crc;
+
+    if (len < 8u)
+    {
+        return;
+    }
+
+    if ((frame[0] != MODBUS_SLAVE_ID) && (frame[0] != 0u))
+    {
+        return;
+    }
+
+    rx_crc = (uint16_t)frame[len - 1] << 8 | frame[len - 2];
+    calc_crc = modbus_crc16(frame, (uint8_t)(len - 2u));
+    if (rx_crc != calc_crc)
+    {
+        return;
+    }
+
+    // Any valid frame = communication OK
+    g_comm_watchdog = 0;
+    COMM_OK_RELAY_LAT = 1;
+
+    switch (frame[1])
+    {
+        case 0x01:
+            modbus_process_fc01_read_coils(frame);
+            break;
+
+        case 0x05:
+            modbus_process_fc05_write_single_coil(frame);
+            break;
+
+        default:
+            if (frame[0] != 0u) // no response to broadcast
+            {
+                modbus_send_exception(frame[1], 0x01); // illegal function
+            }
+            break;
+    }
+}
+
+static void modbus_poll(void)
+{
+    static uint8_t frame[MODBUS_MAX_FRAME];
+    static uint8_t idx = 0;
+    static uint16_t silent_gap = 0;
+    uint8_t b;
+
+    if (uart_read_byte_nonblocking(&b))
+    {
+        if (idx < MODBUS_MAX_FRAME)
+        {
+            frame[idx++] = b;
+        }
+        silent_gap = 0;
+    }
+    else
+    {
+        if (idx > 0u)
+        {
+            silent_gap++;
+            if (silent_gap > 1000u) // crude inter-frame timeout
+            {
+                modbus_process_frame(frame, idx);
+                idx = 0;
+                silent_gap = 0;
+            }
+        }
     }
 }
 
 static void app_init(void)
 {
+    uint8_t i;
+
+    clock_init_32mhz_internal();
     gpio_init();
+    uart_init_9600_8n1();
 
-    // TODO: UART init for RS485 Modbus RTU (RC6 TX, RC7 RX)
-    // TODO: Modbus slave init (set node ID, baud rate, parity)
-    // NOTE: RB5 DE/RE control is intentionally NOT used because your RS485
-    // module handles RX/TX auto direction internally.
+    for (i = 0; i < COIL_COUNT; i++)
+    {
+        g_coils[i] = false;
+    }
 
-    outputs_all_stop();
+    set_manual_mode(true);
 }
 
 void main(void)
@@ -236,10 +470,19 @@ void main(void)
 
     while (1)
     {
-        // TODO: Poll Modbus stack here.
-        // Example:
-        // modbus_poll();
+        modbus_poll();
 
-        // TODO: Add auto mode logic step-by-step in next iterations.
+        // Communication watchdog
+        g_comm_watchdog++;
+        if (g_comm_watchdog > MODBUS_COMM_TIMEOUT_LOOPS)
+        {
+            COMM_OK_RELAY_LAT = 0; // communication lost with HMI
+        }
+
+        // Basic hard safety hooks (can be expanded)
+        if (ESTOP_PORT == 0u)
+        {
+            outputs_all_stop();
+        }
     }
 }
